@@ -44,9 +44,9 @@ parser.add_argument('--svhn_extra', action='store_true', default=False,
                     help='Adds the extra SVHN data')
 
 # Model config
-parser.add_argument('--model', '-m', default='wrn-28-10', type=str,
+parser.add_argument('--model', '-m', default='ResNet18', type=str,
                     help='Name of the model (see utils.get_model)')
-parser.add_argument('--model_dir', default='/trades/TRADES-master/cifarlabelled1percent',
+parser.add_argument('--model_dir', default='/home/c01sogh/CISPA-home/trades/TRADES-master/cifar10_10percent_wrnpgd-10',
                     help='Directory of model for saving checkpoint')
 parser.add_argument('--overwrite', action='store_true', default=True,
                     help='Cancels the run if an appropriate checkpoint is found')
@@ -72,7 +72,7 @@ parser.add_argument('--batch_size', type=int, default=256, metavar='N',
                     help='Input batch size for training (default: 128)')
 parser.add_argument('--test_batch_size', type=int, default=500, metavar='N',
                     help='Input batch size for testing (default: 128)')
-parser.add_argument('--epochs', type=int, default=100, metavar='N',
+parser.add_argument('--epochs', type=int, default=200, metavar='N',
                     help='Number of epochs to train. '
                          'Note: we arbitrarily define an epoch as a pass '
                          'through 50K datapoints. This is convenient for '
@@ -115,7 +115,7 @@ parser.add_argument('--epsilon', default=0.031, type=float,
                     help='Adversarial perturbation size (takes the role of'
                          ' sigma for stability training)')
 
-parser.add_argument('--pgd_num_steps', default=5, type=int,
+parser.add_argument('--pgd_num_steps', default=1, type=int,
                     help='number of pgd steps in adversarial training')
 parser.add_argument('--pgd_step_size', default=0.007,
                     help='pgd steps size in adversarial training', type=float)
@@ -123,7 +123,7 @@ parser.add_argument('--beta', default=6.0, type=float,
                     help='stability regularization, i.e., 1/lambda in TRADES')
 
 # Semi-supervised training configuration
-parser.add_argument('--aux_data_filename', default='/ti_500K_pseudo_labeled.pickle', type=str,
+parser.add_argument('--aux_data_filename', default= None, type=str,
                     help='Path to pickle file containing unlabeled data and '
                          'pseudo-labels used for RST')
 
@@ -202,19 +202,6 @@ trainset = SemiSupervisedDataset(base_dataset=args.dataset,
 # num_batches=50000 enforces the definition of an "epoch" as passing through 50K
 # datapoints
 # TODO: make sure that this code works also when trainset.unsup_indices=[]
-#sup_indices = trainset.sup_indices
-#unsup_indices = trainset.unsup_indices
-
-# Take 10% of the supervised indices
-#num_sup_samples = int(len(sup_indices) * 0.1)  # 10% of supervised samples
-#random.seed(args.seed)
-#subset_sup_indices = random.sample(sup_indices, num_sup_samples)  # Random 10%
-
-# Combine the selected supervised indices and all unsupervised indices
-#combined_indices = subset_sup_indices + unsup_indices
-
-# Create the subset of the training set
-#trainset = Subset(trainset, combined_indices)
 train_batch_sampler = SemiSupervisedSampler(
     trainset.sup_indices, trainset.unsup_indices,
     args.batch_size, args.unsup_fraction,
@@ -246,10 +233,9 @@ def train(args, model, device, train_loader, optimizer, epoch):
                            optimizer=optimizer,
                            step_size=args.pgd_step_size,
                            epsilon=args.epsilon,
-                           perturb_steps=5,
-                           beta=1.0,
-                           distance="l_inf")
-        loss.backward()
+               		   perturb_steps=10,
+                	   beta=1.0,
+                	   distance='l_inf')
         optimizer.step()
 
         # print progress
@@ -323,16 +309,17 @@ def main():
     # init model, ResNet18() can be also used here for training
     #model = ResNet18().to(device)
     #optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
-    num_classes = 10
+    #checkpoint1 = torch.load('/home/c01sogh/CISPA-home/trades/TRADES-master/cifar10_20percent_dataratio0.3generated_DDPM_beta100percentrandomsamples/model-wideres-epoch75.pt')
+    #num_classes = 10
                 
         #normalize_input = checkpoint.get('normalize_input', False)
     model = 'wrn-28-10'
-    model = get_model(model, num_classes=num_classes,
-                        normalize_input=False)
-    #model.load_state_dict(checkpoint1)
-    #num_classes = 10
     #model = get_model(model, num_classes=num_classes,
-                      #normalize_input=args.normalize_input)
+                        #normalize_input=False)
+    #model.load_state_dict(checkpoint1)
+    num_classes = 10
+    model = get_model(model, num_classes=num_classes,
+                      normalize_input=args.normalize_input)
     if use_cuda:
         model = torch.nn.DataParallel(model).cuda()
     optimizer = optim.SGD(model.parameters(), lr=args.lr,
