@@ -374,7 +374,65 @@ class SemiSupervisedDataset(Dataset):
                 self.unsup_indices = []
                 self.unsup_indices.extend(
                     range(orig_len, orig_len+len(selected_data)))
-            
+            else:
+                self.unsup_indices = []
+                # Use these indices to select the corresponding images and labels
+                orig_len = len(self.data)
+                self.sup_indices = list(range(len(self.targets)))
+                # === Step 1: Define the directory containing saved images generated/extra===
+                generated_dir = "/home/c01sogh/CISPA-home/trades/TRADES-master/generated_risky_samples_2/"
+
+                # === Step 2: Define transform (same as used in CIFAR-10) ===
+                transform = transforms.Compose([
+                    transforms.ToTensor(),  # Converts [0, 255] PIL image to [0.0, 1.0] float tensor
+                ])
+
+                # === Step 3: Load saved PNG images ===
+                image_tensors = []
+                filenames = sorted([f for f in os.listdir(generated_dir) if f.endswith(".png")])
+                for fname in filenames:
+                    img_path = os.path.join(generated_dir, fname)
+                    img = Image.open(img_path).convert("RGB")
+                    img_tensor = transform(img)
+                    image_tensors.append(img_tensor)
+
+                image_tensor_batch = torch.stack(image_tensors)  # Shape: [N, 3, 32, 32]
+
+                # === Step 4: Load your classifier model ===
+               
+
+                checkpoint1 = torch.load('/home/c01sogh/CISPA-home/trades/TRADES-master/cifar10_20percent_dataratio0.7_123generated_DDPM_beta0.4/model-wideres-epoch100.pt')
+                num_classes = 10
+                
+                    #normalize_input = checkpoint.get('normalize_input', False)
+                model1 = 'wrn-28-10'
+                model = get_model(model1, num_classes=num_classes,
+                                    normalize_input=False)
+                model = nn.DataParallel(model).cuda()
+                model.load_state_dict(checkpoint1) 
+                model.eval()
+                # === Step 5: Predict labels for the generated images ===
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                predicted_labels = []
+
+                with torch.no_grad():
+                    image_tensor_batch = image_tensor_batch.to(device)
+                    outputs = model(image_tensor_batch)
+                    predicted_labels = torch.argmax(outputs, dim=1).cpu().tolist()
+
+                # === Step 6: Add these to your dataset ===
+                generated_data_np = image_tensor_batch.mul(255).clamp(0, 255).byte().permute(0, 2, 3, 1).cpu().numpy()  # Convert to NumPy
+                #generated_data_np = np.transpose(generated_data_np, (0, 2, 3, 1))  # Convert from [N, 3, 32, 32] to [N, 32, 32, 3]
+
+
+                orig_len = len(self.data)
+                self.data = np.concatenate([self.data, generated_data_np])
+                self.targets.extend(predicted_labels)
+                self.unsup_indices.extend(range(orig_len, orig_len + len(generated_data_np)))
+
+                print(f"✅ {len(generated_data_np)} risky samples added to CIFAR-10 training data.")
+
+
             logger = logging.getLogger()
             logger.info("Training set")
             logger.info("Number of training samples: %d", len(self.targets))
