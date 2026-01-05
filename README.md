@@ -14,6 +14,9 @@ Below are links to files containing generated data from the paper Improving Robu
 - [CIFAR-10 Generated Data (https://storage.googleapis.com/dm-adversarial-robustness/cifar10_ddpm.npz)]
 - [SVHN Generated Data (https://storage.googleapis.com/dm-adversarial-robustness/svhn_ddpm.npz)]
 
+## In order to directly generate data near the boundary 
+- diffusionm.py can be used to generate data near the boundary and this data can be used to train the final model.
+
 
 The code in this repo is based on code from the following sources:  
 - TRADES: https://github.com/yaodongyu/TRADES  
