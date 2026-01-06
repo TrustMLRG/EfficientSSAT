@@ -234,7 +234,7 @@ def train(args, model, device, train_loader, optimizer, epoch):
                            step_size=args.pgd_step_size,
                            epsilon=args.epsilon,
                		   perturb_steps=10,
-                	   beta=1.0,
+                	   beta=args.beta,
                 	   distance='l_inf')
         optimizer.step()
 
