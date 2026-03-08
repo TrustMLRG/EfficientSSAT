@@ -184,11 +184,6 @@ class ShakeNet(nn.Module):
         x = F.adaptive_avg_pool2d(x, output_size=1)
         return x
 
-    # def forward(self, x):
-    #     x = self._forward_conv(x)
-    #     x = x.view(x.size(0), -1)
-    #     x = self.fc(x)
-    #     return x
 
     def forward(self, x, return_prelogit=False):
         prelogit = self._forward_conv(x)

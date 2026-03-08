@@ -1,157 +1,270 @@
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+from typing import Optional
+
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-from torchvision.utils import save_image, make_grid
-from diffusers import UNet2DModel, DDPMScheduler
-from tqdm import tqdm
-import os
-from models.wideresnet import *
-from models.resnet import *
-from trades import trades_loss
-from PIL import Image
 import torchvision.transforms.functional as TF
 
-from utils import get_model  # Your custom WRN loader
+from utils import load_model_from_checkpoint
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# -------------------------
-# 1. Load Your Classifier
-# -------------------------
-num_classes = 10
-classifier = get_model("wrn-28-10", num_classes=num_classes, normalize_input=False)
-checkpoint = torch.load('/home/c01sogh/CISPA-home/trades/TRADES-master/cifar10_20percent_dataratio0.3generated_DDPM_beta60percentrandomsamples/model-wideres-epoch200.pt')
-classifier = nn.DataParallel(classifier).to(device)
-classifier.load_state_dict(checkpoint)
-classifier.eval()
-for p in classifier.parameters():
-    p.requires_grad = False  # Freeze classifier
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Fine-tune a CIFAR-10 DDPM with a boundary-aware loss from a frozen classifier."
+    )
 
-# -------------------------
-# 2. Load DDPM UNet Model
-# -------------------------
-model = UNet2DModel.from_pretrained("google/ddpm-cifar10-32").to(device)
-model.train()
+    parser.add_argument(
+        "--classifier_arch",
+        default="wrn-28-10",
+        help="Classifier architecture (see utils.get_model).",
+    )
+    parser.add_argument(
+        "--classifier_ckpt",
+        required=True,
+        help="Path to classifier checkpoint (state_dict).",
+    )
 
-scheduler = DDPMScheduler.from_pretrained("google/ddpm-cifar10-32")
+    parser.add_argument(
+        "--diffusion_id",
+        default="google/ddpm-cifar10-32",
+        help="Diffusers model id or local path.",
+    )
 
-# -------------------------
-# 3. CIFAR-10 DataLoader
-# -------------------------
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.5,), (0.5,)),  # [-1, 1] for DDPM
-])
-trainset = datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
-trainloader = DataLoader(trainset, batch_size=64, shuffle=True, num_workers=4)
+    parser.add_argument("--data_root", default="./data", help="Dataset directory.")
+    parser.add_argument(
+        "--download",
+        dest="download",
+        action="store_true",
+        help="Download dataset if missing.",
+    )
+    parser.add_argument(
+        "--no-download",
+        dest="download",
+        action="store_false",
+        help="Do not download dataset (default).",
+    )
+    parser.set_defaults(download=False)
 
-# -------------------------
-# 4. Confidence Minimization Loss
-# -------------------------
-def confidence_minimization_loss(logits):
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--num_workers", type=int, default=0)
+
+    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--lambda_adv", type=float, default=0.5)
+    parser.add_argument(
+        "--timesteps_train",
+        type=int,
+        default=None,
+        help="Optional number of diffusion timesteps for training speed.",
+    )
+
+    parser.add_argument(
+        "--finetuned_out",
+        default="./outputs/diffusionm/finetuned.pth",
+        help="Output path for fine-tuned UNet state_dict.",
+    )
+
+    parser.add_argument("--total_images", type=int, default=100)
+    parser.add_argument("--sample_batch", type=int, default=50)
+    parser.add_argument(
+        "--timesteps_sample",
+        type=int,
+        default=1000,
+        help="Number of diffusion timesteps for sampling.",
+    )
+    parser.add_argument(
+        "--samples_out",
+        default="./outputs/diffusionm/samples",
+        help="Directory to write generated sample images.",
+    )
+
+    parser.add_argument("--no-cuda", action="store_true", default=False)
+    return parser
+
+
+def _die(message: str) -> None:
+    raise SystemExit(message)
+
+
+def confidence_minimization_loss(logits: torch.Tensor) -> torch.Tensor:
     probs = F.softmax(logits, dim=1)
-    max_conf = probs.max(dim=1)[0]
+    max_conf = probs.max(dim=1).values
     return -max_conf.mean()
 
-# -------------------------
-# 5. Fine-Tuning Loop
-# -------------------------
-optimizer = torch.optim.Adam(model.parameters(), lr=2e-5)
-lambda_adv = 0.5  # weight for adversarial loss
-n_epochs = 7
 
-for epoch in range(n_epochs):
-    pbar = tqdm(trainloader)
-    for batch in pbar:
-        x_start, _ = batch
-        x_start = x_start.to(device)
+def _sample_train_timesteps(scheduler, batch_size: int, device: torch.device) -> torch.Tensor:
+    timesteps = getattr(scheduler, "timesteps", None)
+    if timesteps is None:
+        return torch.randint(
+            0, int(scheduler.config.num_train_timesteps), (batch_size,), device=device
+        ).long()
 
-        # 1. Sample random timestep
-        bsz = x_start.size(0)
-        t = torch.randint(0, scheduler.config.num_train_timesteps, (bsz,), device=device).long()
-
-        # 2. Add noise
-        noise = torch.randn_like(x_start)
-        x_noisy = scheduler.add_noise(x_start, noise, t)
-
-        # 3. Predict noise
-        noise_pred = model(x_noisy, t).sample
-
-        # 4. Standard DDPM loss
-        ddpm_loss = F.mse_loss(noise_pred, noise)
-
-        # 5. Reconstruct x_start from predicted noise
-        with torch.no_grad():
-            x_recon_list = []
-            for i in range(x_noisy.size(0)):
-                x_i = x_noisy[i].unsqueeze(0)
-                noise_pred_i = noise_pred[i].unsqueeze(0)
-                t_i = t[i].item()  # convert to scalar
-                out = scheduler.step(noise_pred_i, t_i, x_i)
-                x_recon_list.append(out["prev_sample"])
-
-            x_recon = torch.cat(x_recon_list, dim=0)
+    timesteps = torch.as_tensor(timesteps, device=device)
+    indices = torch.randint(0, timesteps.numel(), (batch_size,), device=device)
+    return timesteps[indices].long()
 
 
-        # 6. Adversarial loss (confidence minimization)
-        logits = classifier(x_recon)
-        adv_loss = confidence_minimization_loss(logits)
+def _guidance_sample_from_step_output(step_output) -> torch.Tensor:
+    pred_original_sample = getattr(step_output, "pred_original_sample", None)
+    if pred_original_sample is not None:
+        return pred_original_sample
+    if isinstance(step_output, tuple) and len(step_output) >= 2 and step_output[1] is not None:
+        return step_output[1]
+    raise RuntimeError(
+        "Scheduler.step did not return pred_original_sample; please use a diffusers version "
+        "that exposes the clean reconstruction for guidance."
+    )
 
-        # 7. Total loss
-        loss = ddpm_loss + lambda_adv * adv_loss
 
-        # 8. Backprop
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+def _predict_clean_sample(
+    scheduler,
+    noise_pred: torch.Tensor,
+    timesteps: torch.Tensor,
+    noisy_sample: torch.Tensor,
+) -> torch.Tensor:
+    try:
+        step_output = scheduler.step(noise_pred, timesteps, noisy_sample)
+        return _guidance_sample_from_step_output(step_output)
+    except Exception:
+        parts = []
+        for i in range(noisy_sample.size(0)):
+            step_output = scheduler.step(
+                noise_pred[i : i + 1], int(timesteps[i].item()), noisy_sample[i : i + 1]
+            )
+            parts.append(_guidance_sample_from_step_output(step_output))
+        return torch.cat(parts, dim=0)
 
-        pbar.set_description(f"Epoch {epoch+1} | Loss: {loss.item():.4f} | DDPM: {ddpm_loss.item():.4f} | Adv: {adv_loss.item():.4f}")
 
-# -------------------------
-# 6. Save Fine-Tuned Model
-# -------------------------
-os.makedirs("outputs", exist_ok=True)
-torch.save(model.state_dict(), "/home/c01sogh/CISPA-home/trades/TRADES-master/fine_tuned_ddpm_confmin.pth")
-print("✅ Fine-tuned DDPM saved.")
+def main(argv: Optional[list[str]] = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
 
-# -------------------------
-# 7. Generate Samples
+    use_cuda = (not args.no_cuda) and torch.cuda.is_available()
+    device = torch.device("cuda" if use_cuda else "cpu")
 
-# -------------------------
-# 7. Generate 30,000 Samples in Batches
-# -------------------------
-print("🎨 Generating 30,000 risky samples in batches...")
-model.eval()
+    try:
+        from diffusers import UNet2DModel, DDPMScheduler  # type: ignore
+        from tqdm import tqdm  # type: ignore
+    except Exception as e:  # noqa: BLE001
+        _die(f"diffusers and tqdm are required. Install with: pip install -r requirements.txt\n{e}")
 
-total_images = 100000
-batch_size = 100   # adjust depending on your GPU memory
-start_index = 0  # adjust starting index if continuing
-output_dir = "/home/c01sogh/CISPA-az6/dropattack-2024/YOLO_project_2/trades/newdiff_5_riskynotminus"
-os.makedirs(output_dir, exist_ok=True)
+    # Load frozen classifier (expects inputs in [0, 1]).
+    classifier = load_model_from_checkpoint(
+        args.classifier_arch,
+        args.classifier_ckpt,
+        map_location="cpu",
+        num_classes=10,
+        device=device,
+    )
+    classifier.eval()
+    for p in classifier.parameters():
+        p.requires_grad = False
 
-num_batches = 1000
-scheduler.set_timesteps(1000)
+    # Load diffusion UNet + scheduler.
+    unet = UNet2DModel.from_pretrained(args.diffusion_id).to(device)
+    unet.train()
+    scheduler = DDPMScheduler.from_pretrained(args.diffusion_id)
+    if args.timesteps_train is not None:
+        scheduler.set_timesteps(int(args.timesteps_train))
 
-for batch_num in range(num_batches):
-    # 1. Sample initial Gaussian noise
-    x = torch.randn((batch_size, 3, 32, 32), device=device)
+    # CIFAR-10 train loader. DDPM expects inputs in [-1, 1].
+    ddpm_transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ]
+    )
+    try:
+        trainset = datasets.CIFAR10(
+            root=args.data_root, train=True, download=args.download, transform=ddpm_transform
+        )
+    except Exception as e:  # noqa: BLE001
+        _die(str(e))
 
-    # 2. Reverse DDPM process
-    for t in scheduler.timesteps:
-        with torch.no_grad():
-            noise_pred = model(x, t).sample
-        x = scheduler.step(noise_pred, t, x)["prev_sample"]
+    trainloader = DataLoader(
+        trainset,
+        batch_size=int(args.batch_size),
+        shuffle=True,
+        num_workers=int(args.num_workers),
+        pin_memory=use_cuda,
+    )
 
-    # 3. Unnormalize to [0,1]
-    samples = (x.clamp(-1, 1) + 1) / 2
+    optimizer = torch.optim.Adam(unet.parameters(), lr=float(args.lr))
 
-    # 4. Save each image
-    for idx, img_tensor in enumerate(samples):
-        img = TF.to_pil_image(img_tensor.cpu())
-        img.save(os.path.join(output_dir, f"sample_{start_index + batch_num * batch_size + idx:05d}.png"))
+    for epoch in range(int(args.epochs)):
+        pbar = tqdm(trainloader, desc=f"Epoch {epoch+1}/{int(args.epochs)}")
+        for x_start, _ in pbar:
+            x_start = x_start.to(device)
+            bsz = x_start.size(0)
+            t = _sample_train_timesteps(scheduler, bsz, device)
 
-    print(f" Batch {batch_num+1}/{num_batches} saved.")
+            noise = torch.randn_like(x_start)
+            x_noisy = scheduler.add_noise(x_start, noise, t)
 
-print(f" All {total_images} images saved to: {output_dir}")
+            noise_pred = unet(x_noisy, t).sample
+            ddpm_loss = F.mse_loss(noise_pred, noise)
+
+            # Guide the UNet using the predicted clean sample x0, not x_{t-1}.
+            x_recon = _predict_clean_sample(scheduler, noise_pred, t, x_noisy)
+
+            x_for_clf = (x_recon.clamp(-1, 1) + 1) / 2
+            logits = classifier(x_for_clf)
+            adv_loss = confidence_minimization_loss(logits)
+
+            loss = ddpm_loss + float(args.lambda_adv) * adv_loss
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+            pbar.set_postfix(
+                loss=float(loss.item()),
+                ddpm=float(ddpm_loss.item()),
+                adv=float(adv_loss.item()),
+            )
+
+    finetuned_out = Path(args.finetuned_out)
+    finetuned_out.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(unet.state_dict(), finetuned_out)
+    print(f"Saved fine-tuned UNet to: {finetuned_out}")
+
+    # Sampling
+    samples_out = Path(args.samples_out)
+    samples_out.mkdir(parents=True, exist_ok=True)
+    unet.eval()
+
+    total_images = int(args.total_images)
+    sample_batch = int(args.sample_batch)
+    timesteps_sample = int(args.timesteps_sample)
+
+    scheduler.set_timesteps(timesteps_sample)
+    produced = 0
+    batch_idx = 0
+
+    while produced < total_images:
+        cur_bs = min(sample_batch, total_images - produced)
+        x = torch.randn((cur_bs, 3, 32, 32), device=device)
+
+        for t in scheduler.timesteps:
+            with torch.no_grad():
+                noise_pred = unet(x, t).sample
+            x = scheduler.step(noise_pred, t, x).prev_sample
+
+        samples = (x.clamp(-1, 1) + 1) / 2
+        for i in range(cur_bs):
+            img = TF.to_pil_image(samples[i].cpu())
+            img.save(samples_out / f"sample_{batch_idx:06d}.png")
+            batch_idx += 1
+
+        produced += cur_bs
+
+    print(f"Wrote {total_images} samples to: {samples_out}")
+
+
+if __name__ == "__main__":
+    main()

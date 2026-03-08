@@ -154,10 +154,3 @@ class ResNet(nn.Module):
         x = self.fc(x)
 
         return x
-
-
-# def resnet(**kwargs):
-#     """
-#     Constructs a ResNet model.
-#     """
-#     return ResNet(**kwargs)

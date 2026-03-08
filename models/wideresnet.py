@@ -1,4 +1,13 @@
+"""WideResNet model.
+
+Based on the TRADES reference implementation:
+https://github.com/yaodongyu/TRADES
+"""
+
+from __future__ import annotations
+
 import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -48,19 +57,18 @@ class NetworkBlock(nn.Module):
 
 
 class WideResNet(nn.Module):
-    def __init__(self, depth=16, num_classes=10, widen_factor=8, dropRate=0.0):
-        super(WideResNet, self).__init__()
+    def __init__(self, depth=28, num_classes=10, widen_factor=10, dropRate=0.0):
+        super().__init__()
         nChannels = [16, 16 * widen_factor, 32 * widen_factor, 64 * widen_factor]
-        assert ((depth - 4) % 6 == 0)
-        n = (depth - 4) / 6
+        if (depth - 4) % 6 != 0:
+            raise ValueError(f"Invalid WideResNet depth: {depth}")
+        n = (depth - 4) // 6
         block = BasicBlock
         # 1st conv before any network block
         self.conv1 = nn.Conv2d(3, nChannels[0], kernel_size=3, stride=1,
                                padding=1, bias=False)
         # 1st block
         self.block1 = NetworkBlock(n, nChannels[0], nChannels[1], block, 1, dropRate)
-        # 1st sub-block
-        self.sub_block1 = NetworkBlock(n, nChannels[0], nChannels[1], block, 1, dropRate)
         # 2nd block
         self.block2 = NetworkBlock(n, nChannels[1], nChannels[2], block, 2, dropRate)
         # 3rd block
@@ -73,20 +81,23 @@ class WideResNet(nn.Module):
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
-                m.weight.data.normal_(0, math.sqrt(2. / n))
+                nn_init = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2.0 / nn_init))
             elif isinstance(m, nn.BatchNorm2d):
                 m.weight.data.fill_(1)
                 m.bias.data.zero_()
             elif isinstance(m, nn.Linear):
                 m.bias.data.zero_()
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor, return_prelogit: bool = False):
         out = self.conv1(x)
         out = self.block1(out)
         out = self.block2(out)
         out = self.block3(out)
         out = self.relu(self.bn1(out))
         out = F.avg_pool2d(out, 8)
-        out = out.view(-1, self.nChannels)
-        return self.fc(out)
+        prelogit = out.view(-1, self.nChannels)
+        logits = self.fc(prelogit)
+        if return_prelogit:
+            return logits, prelogit
+        return logits

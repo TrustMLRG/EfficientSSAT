@@ -1,128 +1,151 @@
-from __future__ import print_function
-import os
+from __future__ import annotations
+
 import argparse
+from typing import Optional
+
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision
-from torch.autograd import Variable
+from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-from models.wideresnet import *
-from models.resnet import *
-from utils import get_model
-from autoattack import AutoAttack  # Import AutoAttack
 
-parser = argparse.ArgumentParser(description='PyTorch CIFAR AutoAttack Evaluation')
-parser.add_argument('--test-batch-size', type=int, default=200, metavar='N',
-                    help='input batch size for testing (default: 200)')
-parser.add_argument('--no-cuda', action='store_true', default=False,
-                    help='disables CUDA training')
-parser.add_argument('--epsilon', default=0.031,
-                    help='perturbation')
-parser.add_argument('--model-path',
-                    default='',
-                    help='model for white-box attack evaluation')
-parser.add_argument('--source-model-path',
-                    default='./checkpoints/model_cifar_wrn.pt',
-                    help='source model for black-box attack evaluation')
-parser.add_argument('--target-model-path',
-                    default='./checkpoints/model_cifar_wrn.pt',
-                    help='target model for black-box attack evaluation')
-parser.add_argument('--white-box-attack', default=True,
-                    help='whether perform white-box attack')
+from utils import load_model_from_checkpoint
 
-args = parser.parse_args()
 
-# settings
-use_cuda = not args.no_cuda and torch.cuda.is_available()
-device = torch.device("cuda" if use_cuda else "cpu")
-kwargs = {'num_workers': 1, 'pin_memory': True} if use_cuda else {}
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="CIFAR-10 AutoAttack Evaluation")
 
-# set up data loader
-transform_test = transforms.Compose([transforms.ToTensor(),])
-testset = torchvision.datasets.CIFAR10(root='../data', train=False, download=True, transform=transform_test)
-test_loader = torch.utils.data.DataLoader(testset, batch_size=args.test_batch_size, shuffle=False, **kwargs)
+    parser.add_argument("--model", default="wrn-28-10", help="Model architecture.")
+    parser.add_argument(
+        "--model_path",
+        required=True,
+        help="Checkpoint path for evaluation.",
+    )
+    parser.add_argument("--data_dir", default="./data", help="Dataset directory.")
+    parser.add_argument(
+        "--download",
+        dest="download",
+        action="store_true",
+        help="Download dataset if missing.",
+    )
+    parser.add_argument(
+        "--no-download",
+        dest="download",
+        action="store_false",
+        help="Do not download dataset (default).",
+    )
+    parser.set_defaults(download=False)
 
-def eval_adv_test_autoattack(model, device, test_loader, epsilon):
-    """
-    Evaluate model by AutoAttack (white-box)
-    """
+    parser.add_argument("--batch_size", type=int, default=200, help="Batch size.")
+    parser.add_argument(
+        "--n_examples",
+        type=int,
+        default=None,
+        help="Optional cap on number of test examples to evaluate.",
+    )
+    parser.add_argument(
+        "--epsilon",
+        type=float,
+        default=0.031,
+        help="Attack epsilon (Linf).",
+    )
+    parser.add_argument(
+        "--version",
+        type=str,
+        default="standard",
+        help="AutoAttack version (e.g., standard).",
+    )
+    parser.add_argument("--no-cuda", action="store_true", default=False, help="Disable CUDA.")
+
+    return parser
+
+
+def _die(message: str) -> None:
+    raise SystemExit(message)
+
+
+def _load_cifar10_test_loader(args: argparse.Namespace, use_cuda: bool) -> DataLoader:
+    transform_test = transforms.Compose([transforms.ToTensor()])
+    try:
+        testset = datasets.CIFAR10(
+            root=args.data_dir,
+            train=False,
+            download=args.download,
+            transform=transform_test,
+        )
+    except Exception as e:  # noqa: BLE001
+        _die(str(e))
+
+    loader_kwargs = {"num_workers": 0, "pin_memory": True} if use_cuda else {"num_workers": 0}
+    return DataLoader(testset, batch_size=args.batch_size, shuffle=False, **loader_kwargs)
+
+
+def _load_model(arch: str, ckpt_path: str, device: torch.device) -> torch.nn.Module:
+    model = load_model_from_checkpoint(
+        arch,
+        ckpt_path,
+        map_location="cpu",
+        num_classes=10,
+        device=device,
+    )
     model.eval()
-    total_samples = len(test_loader.dataset)
+    return model
 
-    # Initialize AutoAttack
-    adversary = AutoAttack(model, norm='Linf', eps=epsilon, version='standard')
-    adversary.attacks_to_run = ['apgd-ce', 'apgd-dlr', 'fab-t', 'square']
 
-    # Create data loader
-    x_test, y_test = [], []
-    for data, target in test_loader:
-        x_test.append(data)
-        y_test.append(target)
-    x_test=x_test[:50]
-    y_test=y_test[:50]
-    x_test = torch.cat(x_test, 0).to(device)
-    y_test = torch.cat(y_test, 0).to(device)
-    total_samples = len(x_test)
+def main(argv: Optional[list[str]] = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
 
-    # Perform AutoAttack
+    use_cuda = (not args.no_cuda) and torch.cuda.is_available()
+    device = torch.device("cuda" if use_cuda else "cpu")
+
+    try:
+        from autoattack import AutoAttack  # type: ignore
+    except Exception as e:  # noqa: BLE001
+        _die(f"autoattack is required. Install dependencies with: pip install -r requirements.txt\n{e}")
+
+    model = _load_model(args.model, args.model_path, device)
+    test_loader = _load_cifar10_test_loader(args, use_cuda=use_cuda)
+
+    x_list = []
+    y_list = []
+    seen = 0
+    for x, y in test_loader:
+        if args.n_examples is not None and seen >= args.n_examples:
+            break
+        if args.n_examples is not None:
+            remaining = args.n_examples - seen
+            x = x[:remaining]
+            y = y[:remaining]
+        x_list.append(x)
+        y_list.append(y)
+        seen += int(y.size(0))
+
+    if not x_list:
+        _die("No test data loaded.")
+
+    x_test = torch.cat(x_list, dim=0).to(device)
+    y_test = torch.cat(y_list, dim=0).to(device)
+
     with torch.no_grad():
-        adv_complete = adversary.run_standard_evaluation(x_test, y_test, bs=args.test_batch_size)
-   # Print the keys and the shape of each tensor in adv_complete
-    #print("Shape of adv_complete['clean_pred']: ", adv_complete['clean_pred'].shape)
-    #print("adv_complete::", adv_complete['clean_pred'])
-    #print("adv_complete::", adv_complete['adv_pred'])
-    #print("clean_pred shape:", adv_complete['clean_pred'].shape if isinstance(adv_complete['clean_pred'], torch.Tensor) else type(adv_complete['clean_pred']))
-    #print("adv_pred shape:", adv_complete['adv_pred'].shape if isinstance(adv_complete['adv_pred'], torch.Tensor) else type(adv_complete['adv_pred']))
-    def flatten_pred(tensor):
-        if tensor.dim() == 4:  # If it's batch x channels x height x width, reduce to batch x classes
-            return tensor.argmax(dim=1)  # Get predicted class along channel dimension
-        return tensor
+        clean_pred = model(x_test).argmax(dim=1)
+        clean_acc = 100.0 * clean_pred.eq(y_test).float().mean().item()
 
-    # Apply flattening to clean and adversarial predictions
-    print(adv_complete)
-    is_correct_adv = []
-
-    # We only have one "iteration" in AutoAttack, but to maintain compatibility
-    # with your PGD structure, we'll store the adversarial correctness once.
-    is_correct_adv.append(np.reshape(
-        (model(adv_complete).argmax(dim=1) == y).float().cpu().numpy(),
-        [-1, 1])
+    adversary = AutoAttack(
+        model,
+        norm="Linf",
+        eps=float(args.epsilon),
+        version=str(args.version),
+        device="cuda" if use_cuda else "cpu",
     )
 
-    # Convert the list of 2D arrays into a single 2D numpy array
-    is_correct_adv = np.concatenate(is_correct_adv, axis=1)
-    #clean_pred = flatten_pred(adv_complete['clean_pred'])
-    #adv_pred = flatten_pred(adv_complete)
-    #natural_accuracy = 100. * (total_samples - (adv_complete['clean_pred'] != y_test).float().sum().item()) / total_samples
-    #robust_accuracy = 100. * (total_samples - (adv_complete != y_test).float().sum().item()) / total_samples
-    print( is_correct_adv)
-    print('AutoAttack (white-box):')
-   # print('Natural Accuracy: {:.2f}%'.format(natural_accuracy))
-    print('Robust Accuracy: {:.2f}%'.format(robust_accuracy))
+    x_adv = adversary.run_standard_evaluation(x_test, y_test, bs=int(args.batch_size))
+
+    with torch.no_grad():
+        adv_pred = model(x_adv).argmax(dim=1)
+        robust_acc = 100.0 * adv_pred.eq(y_test).float().mean().item()
+
+    print(f"Natural Accuracy: {clean_acc:.2f}%")
+    print(f"Robust Accuracy:  {robust_acc:.2f}%")
 
 
-def main():
-    if args.white_box_attack:
-        # white-box attack
-        print('AutoAttack (white-box)')
-        model = 'wrn-28-10'
-        model = get_model(model, num_classes=10, normalize_input=False)
-        if use_cuda:
-            model = torch.nn.DataParallel(model).cuda()
-        checkpoint = torch.load(args.model_path)
-        model.load_state_dict(checkpoint)
-        
-        eval_adv_test_autoattack(model, device, test_loader, epsilon=args.epsilon)
-    else:
-        # black-box attack
-        print('pgd black-box attack')
-        model_target = WideResNet().to(device)
-        model_target.load_state_dict(torch.load(args.target_model_path))
-        model_source = WideResNet().to(device)
-        model_source.load_state_dict(torch.load(args.source_model_path))
-
-        eval_adv_test_blackbox(model_target, model_source, device, test_loader)
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

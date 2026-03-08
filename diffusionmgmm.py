@@ -1,335 +1,395 @@
-#!/usr/bin/env python3
-"""
-Fine-tune DDPM UNet with boundary-aware loss from a frozen WRN classifier.
-This version uses per-class Gaussian Mixture Models (GMM) on classifier logits
-instead of k-means to define cluster means ("centroids").
-"""
+from __future__ import annotations
 
-import os
+import argparse
+from pathlib import Path
+from typing import Optional
+
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 import torchvision.transforms.functional as TF
-from tqdm import tqdm
-from diffusers import UNet2DModel, DDPMScheduler
-from PIL import Image
-from typing import Dict, Tuple
 
-# Try to import sklearn's GaussianMixture for CPU-side clustering
-try:
-    from sklearn.mixture import GaussianMixture
-    _HAS_SKLEARN = True
-except Exception as _e:
-    GaussianMixture = None
-    _HAS_SKLEARN = False
+from utils import load_model_from_checkpoint
 
-# -------------------------
-# Config (edit as needed)
-# -------------------------
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-CLASSIFIER_ARCH = "wrn-28-10"
-NUM_CLASSES = 10
-CLASSIFIER_CKPT = "/home/c01sogh/CISPA-home/trades/TRADES-master/cifar10_20percent_dataratio0.3generated_DDPM_beta60percentrandomsamples/model-wideres-epoch200.pt"
-
-DIFFUSION_ID = "google/ddpm-cifar10-32"
-
-DATA_ROOT = "./data"
-BATCH_SIZE_TRAIN = 64
-NUM_WORKERS = 4
-
-# GMM / boundary config
-K_PER_CLASS = 5              # number of Gaussian components per class
-GMM_MAX_ITERS = 100          # EM iterations (sklearn)
-GMM_COVARIANCE_TYPE = "diag" # {"full","tied","diag","spherical"}
-GMM_REG_COVAR = 1e-6         # numerical stability
-EMBED_WITH_LOGITS = True     # use classifier logits as embedding
-
-# Fine-tune config
-LR = 2e-5
-N_EPOCHS = 5
-LAMBDA_BOUNDARY = 0.5      # weight for boundary loss
-TIMESTEPS_TRAIN = None     # If you'd like fewer timesteps for speed, set int
-
-# Sampling config
-SAMPLES_OUT_DIR = "/home/c01sogh/CISPA-az6/dropattack-2024/YOLO_project_2/trades/newdiff_7_gmmepoch5"
-TOTAL_IMAGES = 1000
-SAMPLE_BATCH = 100
-TIMESTEPS_SAMPLE = 1000    # sampling timesteps (int) or None to use scheduler default
-
-FINETUNED_OUT = "/home/c01sogh/CISPA-home/trades/TRADES-master/fine_tuned_ddpm_cluster_boundary_gmm.pth"
-os.makedirs(os.path.dirname(FINETUNED_OUT), exist_ok=True)
-os.makedirs(SAMPLES_OUT_DIR, exist_ok=True)
-
-# -------------------------
-# Local imports (your code)
-# -------------------------
-# Ensure your project path is on PYTHONPATH or run script from repo root
-from utils import get_model  # your WRN loader - must return nn.Module
-
-# -------------------------
-# 1) Load frozen classifier
-# -------------------------
-print("🔒 Loading frozen classifier...")
-classifier = get_model(CLASSIFIER_ARCH, num_classes=NUM_CLASSES, normalize_input=False)
-
-# load checkpoint safely (handle state_dict vs saved model)
-ckpt = torch.load(CLASSIFIER_CKPT, map_location="cpu")
-if isinstance(ckpt, dict) and "state_dict" in ckpt:
-    state_dict = ckpt["state_dict"]
-else:
-    state_dict = ckpt
-
-def strip_module_prefix(state_dict_in):
-    new = {}
-    for k, v in state_dict_in.items():
-        new_key = k[len("module."):] if k.startswith("module.") else k
-        new[new_key] = v
-    return new
-
-try:
-    classifier.load_state_dict(state_dict)
-except RuntimeError:
-    print("⚠️ Direct load_state_dict failed; attempting to strip 'module.' prefixes and retry...")
-    classifier.load_state_dict(strip_module_prefix(state_dict))
-
-classifier = nn.DataParallel(classifier).to(device)
-classifier.eval()
-for p in classifier.parameters():
-    p.requires_grad = False
-print("✅ Classifier loaded & frozen.")
-
-# -------------------------
-# 2) Load diffusion UNet + scheduler
-# -------------------------
-print(" Loading diffusion model & scheduler...")
-unet = UNet2DModel.from_pretrained(DIFFUSION_ID).to(device)
-unet.train()
-scheduler = DDPMScheduler.from_pretrained(DIFFUSION_ID)
-
-if TIMESTEPS_TRAIN is not None:
-    scheduler.set_timesteps(TIMESTEPS_TRAIN)
-
-# -------------------------
-# 3) CIFAR-10 dataloaders
-# -------------------------
-print(" Preparing CIFAR-10 dataloaders...")
-# DDPM expects inputs in [-1, 1]. Use 3-channel normalization.
-ddpm_transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-])
-
-trainset = datasets.CIFAR10(root=DATA_ROOT, train=True, download=True, transform=ddpm_transform)
-trainloader = DataLoader(trainset, batch_size=BATCH_SIZE_TRAIN, shuffle=True, num_workers=NUM_WORKERS)
-embed_loader = DataLoader(trainset, batch_size=256, shuffle=False, num_workers=NUM_WORKERS)
-
-# -------------------------
-# 4) Build embeddings + pseudo-labels using classifier logits
-# -------------------------
-@torch.no_grad()
-def build_embeddings_and_pseudolabels(loader: DataLoader, model: nn.Module, use_logits: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
-    model.eval()
-    all_embeds = []
-    all_yhat = []
-    for xb, _ in tqdm(loader, desc=" Embedding CIFAR-10 with classifier"):
-        xb = xb.to(device)
-        logits = model(xb)  # (B, NUM_CLASSES)
-        yhat = logits.argmax(dim=1)
-        embeds = logits if use_logits else logits  # fallback to logits if no penultimate features
-        all_embeds.append(embeds.detach().cpu())
-        all_yhat.append(yhat.detach().cpu())
-    Z = torch.cat(all_embeds, dim=0)
-    yhat = torch.cat(all_yhat, dim=0)
-    return Z, yhat
-
-Z_all, yhat_all = build_embeddings_and_pseudolabels(embed_loader, classifier, use_logits=EMBED_WITH_LOGITS)
-print(f" Embedding bank shape: {Z_all.shape}")
-
-# -------------------------
-# 5) Fit per-class GMMs on embeddings (CPU) and use component means as centroids
-# -------------------------
-if not _HAS_SKLEARN:
-    raise ImportError(
-        "scikit-learn is required for GMM clustering. Please install it via 'pip install scikit-learn'"
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Fine-tune a CIFAR-10 DDPM UNet with a GMM-based boundary margin loss."
     )
 
-print(" Fitting per-class Gaussian Mixture Models on embeddings (CPU)...")
-class_centroids: Dict[int, torch.Tensor] = {}
-Z_cpu = Z_all.float().cpu()
-y_cpu = yhat_all.long().cpu()
+    parser.add_argument(
+        "--classifier_arch",
+        default="wrn-28-10",
+        help="Classifier architecture (see utils.get_model).",
+    )
+    parser.add_argument(
+        "--classifier_ckpt",
+        required=True,
+        help="Path to classifier checkpoint (state_dict).",
+    )
 
-for c in range(NUM_CLASSES):
-    idx = (y_cpu == c).nonzero(as_tuple=False).squeeze(-1)
-    if idx.numel() == 0:
-        # No samples predicted as class c; fall back to global mean
-        z_mean = Z_cpu.mean(dim=0, keepdim=True)
-        centroids = z_mean.repeat(K_PER_CLASS, 1)
-        class_centroids[c] = centroids
-        continue
+    parser.add_argument(
+        "--diffusion_id",
+        default="google/ddpm-cifar10-32",
+        help="Diffusers model id or local path.",
+    )
 
-    Zc = Z_cpu[idx]  # (Nc, D)
+    parser.add_argument("--data_root", default="./data", help="Dataset directory.")
+    parser.add_argument(
+        "--download",
+        dest="download",
+        action="store_true",
+        help="Download dataset if missing.",
+    )
+    parser.add_argument(
+        "--no-download",
+        dest="download",
+        action="store_false",
+        help="Do not download dataset (default).",
+    )
+    parser.set_defaults(download=False)
 
-    if Zc.size(0) < K_PER_CLASS:
-        # Not enough samples for requested components; repeat class mean
-        cmean = Zc.mean(dim=0, keepdim=True)
-        centroids = cmean.repeat(K_PER_CLASS, 1)
-        class_centroids[c] = centroids
-        continue
+    # Embedding/GMM config
+    parser.add_argument(
+        "--embed_n_examples",
+        type=int,
+        default=5000,
+        help="Number of training examples used to build the embedding bank for GMM fitting.",
+    )
+    parser.add_argument("--embed_batch_size", type=int, default=256)
+    parser.add_argument("--k_per_class", type=int, default=5)
+    parser.add_argument("--gmm_max_iters", type=int, default=100)
+    parser.add_argument(
+        "--gmm_covariance_type",
+        type=str,
+        default="diag",
+        choices=("full", "tied", "diag", "spherical"),
+    )
+    parser.add_argument("--gmm_reg_covar", type=float, default=1e-6)
 
-    # Fit GMM on numpy (sklearn expects numpy arrays)
-    X = Zc.numpy()
+    # Fine-tune config
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--lambda_boundary", type=float, default=0.5)
+    parser.add_argument(
+        "--timesteps_train",
+        type=int,
+        default=None,
+        help="Optional number of diffusion timesteps for training speed.",
+    )
+
+    # Outputs
+    parser.add_argument(
+        "--finetuned_out",
+        default="./outputs/diffusionmgmm/finetuned.pth",
+        help="Output path for fine-tuned UNet state_dict.",
+    )
+    parser.add_argument("--total_images", type=int, default=100)
+    parser.add_argument("--sample_batch", type=int, default=50)
+    parser.add_argument("--timesteps_sample", type=int, default=1000)
+    parser.add_argument(
+        "--samples_out",
+        default="./outputs/diffusionmgmm/samples",
+        help="Directory to write generated sample images.",
+    )
+
+    parser.add_argument("--no-cuda", action="store_true", default=False)
+    return parser
+
+
+def _die(message: str) -> None:
+    raise SystemExit(message)
+
+
+def _sample_train_timesteps(scheduler, batch_size: int, device: torch.device) -> torch.Tensor:
+    timesteps = getattr(scheduler, "timesteps", None)
+    if timesteps is None:
+        return torch.randint(
+            0, int(scheduler.config.num_train_timesteps), (batch_size,), device=device
+        ).long()
+
+    timesteps = torch.as_tensor(timesteps, device=device)
+    indices = torch.randint(0, timesteps.numel(), (batch_size,), device=device)
+    return timesteps[indices].long()
+
+
+def _guidance_sample_from_step_output(step_output) -> torch.Tensor:
+    pred_original_sample = getattr(step_output, "pred_original_sample", None)
+    if pred_original_sample is not None:
+        return pred_original_sample
+    if isinstance(step_output, tuple) and len(step_output) >= 2 and step_output[1] is not None:
+        return step_output[1]
+    raise RuntimeError(
+        "Scheduler.step did not return pred_original_sample; please use a diffusers version "
+        "that exposes the clean reconstruction for guidance."
+    )
+
+
+def _predict_clean_sample(
+    scheduler,
+    noise_pred: torch.Tensor,
+    timesteps: torch.Tensor,
+    noisy_sample: torch.Tensor,
+) -> torch.Tensor:
     try:
-        gmm = GaussianMixture(
-            n_components=K_PER_CLASS,
-            covariance_type=GMM_COVARIANCE_TYPE,
-            max_iter=GMM_MAX_ITERS,
-            reg_covar=GMM_REG_COVAR,
+        step_output = scheduler.step(noise_pred, timesteps, noisy_sample)
+        return _guidance_sample_from_step_output(step_output)
+    except Exception:
+        parts = []
+        for i in range(noisy_sample.size(0)):
+            step_output = scheduler.step(
+                noise_pred[i : i + 1], int(timesteps[i].item()), noisy_sample[i : i + 1]
+            )
+            parts.append(_guidance_sample_from_step_output(step_output))
+        return torch.cat(parts, dim=0)
+
+
+@torch.no_grad()
+def _collect_logits(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    max_examples: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    logits_all = []
+    yhat_all = []
+    seen = 0
+    for x, _ in loader:
+        if seen >= max_examples:
+            break
+        remaining = max_examples - seen
+        if x.size(0) > remaining:
+            x = x[:remaining]
+        x = x.to(device)
+        logits = model(x)
+        yhat = logits.argmax(dim=1)
+        logits_all.append(logits.detach().cpu())
+        yhat_all.append(yhat.detach().cpu())
+        seen += int(x.size(0))
+    if not logits_all:
+        raise ValueError("No data collected for embeddings.")
+    logits_np = torch.cat(logits_all, dim=0).numpy()
+    yhat_np = torch.cat(yhat_all, dim=0).numpy()
+    return logits_np, yhat_np
+
+
+def _fit_class_centroids(
+    logits_np: np.ndarray,
+    yhat_np: np.ndarray,
+    *,
+    k_per_class: int,
+    gmm_cls,
+    covariance_type: str,
+    max_iter: int,
+    reg_covar: float,
+) -> dict[int, np.ndarray]:
+    if k_per_class <= 0:
+        raise ValueError("--k_per_class must be positive.")
+
+    centroids: dict[int, np.ndarray] = {}
+    n_classes = int(logits_np.shape[1])
+    for c in range(n_classes):
+        idx = np.where(yhat_np == c)[0]
+        if idx.size == 0:
+            mean = logits_np.mean(axis=0, keepdims=True)
+            centroids[c] = np.repeat(mean, k_per_class, axis=0)
+            continue
+
+        class_logits = logits_np[idx]
+        if class_logits.shape[0] < max(2, k_per_class):
+            mean = class_logits.mean(axis=0, keepdims=True)
+            centroids[c] = np.repeat(mean, k_per_class, axis=0)
+            continue
+
+        gmm = gmm_cls(
+            n_components=k_per_class,
+            covariance_type=str(covariance_type),
+            max_iter=int(max_iter),
+            reg_covar=float(reg_covar),
             random_state=42,
             init_params="kmeans",
         )
-        gmm.fit(X)
-        means = torch.from_numpy(gmm.means_).float()  # (K, D)
-    except Exception as e:
-        print(f"⚠️ GMM failed for class {c} with error: {e}. Falling back to repeated class mean.")
-        cmean = Zc.mean(dim=0, keepdim=True)
-        means = cmean.repeat(K_PER_CLASS, 1)
+        gmm.fit(class_logits)
+        centroids[c] = gmm.means_.astype(np.float32)
 
-    class_centroids[c] = means
+    return centroids
 
-print(" GMM fitting complete.")
 
-# Move centroids to device for fast distance computations
-centroids_stack = {c: class_centroids[c].to(device) for c in range(NUM_CLASSES)}
+def main(argv: Optional[list[str]] = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
 
-# -------------------------
-# Helper losses
-# -------------------------
-def confidence_minimization_loss(logits: torch.Tensor) -> torch.Tensor:
-    probs = F.softmax(logits, dim=1)
-    max_conf = probs.max(dim=1)[0]
-    return -max_conf.mean()
+    use_cuda = (not args.no_cuda) and torch.cuda.is_available()
+    device = torch.device("cuda" if use_cuda else "cpu")
 
-@torch.no_grad()
-def logits_and_pseudolabels(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    logits = classifier(x)               # (B, NUM_CLASSES)
-    yhat = logits.argmax(dim=1)          # (B,)
-    return logits, yhat
+    try:
+        from diffusers import UNet2DModel, DDPMScheduler  # type: ignore
+        from tqdm import tqdm  # type: ignore
+    except Exception as e:  # noqa: BLE001
+        _die(f"diffusers and tqdm are required. Install with: pip install -r requirements.txt\n{e}")
 
-# Note: we still compute Euclidean distances to GMM component means.
-# Optionally, you could switch to Mahalanobis using each component's covariance.
-def boundary_margin_loss_from_logits(logits: torch.Tensor, yhat: torch.Tensor, centroids_dict: Dict[int, torch.Tensor]) -> torch.Tensor:
-    embeds = logits
-    B = embeds.size(0)
-    margins = []
-    for i in range(B):
-        c = int(yhat[i].item())
-        Cc = centroids_dict[c]  # (K, D)
-        d = torch.cdist(embeds[i].unsqueeze(0), Cc, p=2).squeeze(0)
-        top2, _ = torch.topk(d, k=min(2, d.numel()), largest=False)
-        if top2.numel() == 1:
-            margin = torch.tensor(0.0, device=embeds.device)
-        else:
-            margin = torch.abs(top2[0] - top2[1])
-        margins.append(margin)
-    if len(margins) == 0:
-        return torch.tensor(0.0, device=embeds.device)
-    return torch.stack(margins, dim=0).mean()
+    try:
+        from sklearn.mixture import GaussianMixture  # type: ignore
+    except Exception as e:  # noqa: BLE001
+        _die(f"scikit-learn is required. Install with: pip install -r requirements.txt\n{e}")
 
-# -------------------------
-# 7) Fine-tuning loop (DDPM + boundary margin loss)
-# -------------------------
-print(" Starting fine-tuning with boundary-aware loss (GMM centroids)...")
-optimizer = torch.optim.Adam(unet.parameters(), lr=LR)
+    # Load frozen classifier (expects inputs in [0, 1]).
+    classifier = load_model_from_checkpoint(
+        args.classifier_arch,
+        args.classifier_ckpt,
+        map_location="cpu",
+        num_classes=10,
+        device=device,
+    )
+    classifier.eval()
+    for p in classifier.parameters():
+        p.requires_grad = False
 
-for epoch in range(N_EPOCHS):
-    pbar = tqdm(trainloader, desc=f"Epoch {epoch+1}/{N_EPOCHS}")
-    for xb, _ in pbar:
-        xb = xb.to(device)
-        bsz = xb.size(0)
+    # Prepare embedding loader (CIFAR-10 in [0,1]).
+    embed_transform = transforms.Compose([transforms.ToTensor()])
+    try:
+        embed_set = datasets.CIFAR10(
+            root=args.data_root, train=True, download=args.download, transform=embed_transform
+        )
+    except Exception as e:  # noqa: BLE001
+        _die(str(e))
 
-        # Use a single (random) timestep per batch to avoid ambiguous boolean error
-        t_int = int(torch.randint(0, scheduler.config.num_train_timesteps, (1,)).item())
-        t_tensor = torch.full((bsz,), t_int, device=device, dtype=torch.long)
+    embed_loader = DataLoader(
+        embed_set,
+        batch_size=int(args.embed_batch_size),
+        shuffle=True,
+        num_workers=0,
+        pin_memory=use_cuda,
+    )
 
-        # Add forward noise
-        noise = torch.randn_like(xb)
-        x_noisy = scheduler.add_noise(xb, noise, t_tensor)
+    logits_np, yhat_np = _collect_logits(
+        classifier, embed_loader, device, max_examples=int(args.embed_n_examples)
+    )
 
-        # Predict noise with unet (t passed as tensor of shape (B,))
-        noise_pred = unet(x_noisy, t_tensor).sample
+    # Fit per-class GMMs on logits (CPU), use means as centroids.
+    try:
+        centroids = _fit_class_centroids(
+            logits_np,
+            yhat_np,
+            k_per_class=int(args.k_per_class),
+            gmm_cls=GaussianMixture,
+            covariance_type=str(args.gmm_covariance_type),
+            max_iter=int(args.gmm_max_iters),
+            reg_covar=float(args.gmm_reg_covar),
+        )
+    except ValueError as e:
+        _die(str(e))
 
-        # Standard DDPM loss
-        ddpm_loss = F.mse_loss(noise_pred, noise)
+    centroids_t = {c: torch.from_numpy(m).to(device) for c, m in centroids.items()}
 
-        # One reverse step (batch) to get x_prev (x_{t-1}) estimate
-        with torch.no_grad():
-            out = scheduler.step(noise_pred, t_int, x_noisy)
-            x_prev = out["prev_sample"]
+    # Load diffusion UNet + scheduler.
+    unet = UNet2DModel.from_pretrained(args.diffusion_id).to(device)
+    unet.train()
+    scheduler = DDPMScheduler.from_pretrained(args.diffusion_id)
+    if args.timesteps_train is not None:
+        scheduler.set_timesteps(int(args.timesteps_train))
 
-        # Boundary loss computed in classifier embedding space
-        logits, yhat = logits_and_pseudolabels(x_prev)
-        boundary_loss = boundary_margin_loss_from_logits(logits, yhat, centroids_stack)
+    # CIFAR-10 train loader in [-1,1] for DDPM.
+    ddpm_transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ]
+    )
+    try:
+        trainset = datasets.CIFAR10(
+            root=args.data_root, train=True, download=args.download, transform=ddpm_transform
+        )
+    except Exception as e:  # noqa: BLE001
+        _die(str(e))
 
-        loss = ddpm_loss + LAMBDA_BOUNDARY * boundary_loss
+    trainloader = DataLoader(
+        trainset,
+        batch_size=int(args.batch_size),
+        shuffle=True,
+        num_workers=int(args.num_workers),
+        pin_memory=use_cuda,
+    )
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+    def boundary_margin_loss(logits: torch.Tensor) -> torch.Tensor:
+        yhat = logits.argmax(dim=1)
+        margins = []
+        for i in range(logits.size(0)):
+            c = int(yhat[i].item())
+            Cc = centroids_t[c]  # (K, D)
+            d = torch.cdist(logits[i].unsqueeze(0), Cc, p=2).squeeze(0)  # (K,)
+            k = min(2, d.numel())
+            topk, _ = torch.topk(d, k=k, largest=False)
+            if topk.numel() < 2:
+                margins.append(torch.tensor(0.0, device=device))
+            else:
+                margins.append(torch.abs(topk[0] - topk[1]))
+        return torch.stack(margins, dim=0).mean()
 
-        pbar.set_postfix({
-            "ddpm": f"{ddpm_loss.item():.4f}",
-            "boundary": f"{boundary_loss.item():.4f}",
-            "total": f"{loss.item():.4f}"
-        })
+    optimizer = torch.optim.Adam(unet.parameters(), lr=float(args.lr))
 
-print(" Fine-tuning complete.")
+    for epoch in range(int(args.epochs)):
+        pbar = tqdm(trainloader, desc=f"Epoch {epoch+1}/{int(args.epochs)}")
+        for x_start, _ in pbar:
+            x_start = x_start.to(device)
+            bsz = x_start.size(0)
+            t = _sample_train_timesteps(scheduler, bsz, device)
 
-# -------------------------
-# 8) Save fine-tuned UNet
-# -------------------------
-torch.save(unet.state_dict(), FINETUNED_OUT)
-print(f" Saved fine-tuned DDPM UNet state_dict to: {FINETUNED_OUT}")
+            noise = torch.randn_like(x_start)
+            x_noisy = scheduler.add_noise(x_start, noise, t)
+            noise_pred = unet(x_noisy, t).sample
+            ddpm_loss = F.mse_loss(noise_pred, noise)
 
-# -------------------------
-# 9) Generate TOTAL_IMAGES samples (batched)
-# -------------------------
-print(f"🎨 Generating {TOTAL_IMAGES} boundary-seeking samples in batches...")
-unet.eval()
+            x_recon = _predict_clean_sample(scheduler, noise_pred, t, x_noisy)
 
-# Ensure scheduler timesteps used for sampling are set (e.g., 1000)
-if TIMESTEPS_SAMPLE is not None:
-    scheduler.set_timesteps(TIMESTEPS_SAMPLE)
+            x_for_clf = (x_recon.clamp(-1, 1) + 1) / 2
+            logits = classifier(x_for_clf)
+            b_loss = boundary_margin_loss(logits)
 
-num_batches = 1000
-img_idx = 0
+            loss = ddpm_loss + float(args.lambda_boundary) * b_loss
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
 
-with torch.no_grad():
-    for b in range(num_batches):
-        cur_batch = min(SAMPLE_BATCH, TOTAL_IMAGES - img_idx)
-        x = torch.randn((cur_batch, 3, 32, 32), device=device)
+            pbar.set_postfix(loss=float(loss.item()), ddpm=float(ddpm_loss.item()), boundary=float(b_loss.item()))
 
-        # reverse diffusion loop
+    finetuned_out = Path(args.finetuned_out)
+    finetuned_out.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(unet.state_dict(), finetuned_out)
+    print(f"Saved fine-tuned UNet to: {finetuned_out}")
+
+    # Sampling
+    samples_out = Path(args.samples_out)
+    samples_out.mkdir(parents=True, exist_ok=True)
+    unet.eval()
+
+    total_images = int(args.total_images)
+    sample_batch = int(args.sample_batch)
+    timesteps_sample = int(args.timesteps_sample)
+    scheduler.set_timesteps(timesteps_sample)
+
+    produced = 0
+    idx = 0
+    while produced < total_images:
+        cur_bs = min(sample_batch, total_images - produced)
+        x = torch.randn((cur_bs, 3, 32, 32), device=device)
         for t in scheduler.timesteps:
-            t_int = int(t)
-            t_tensor = torch.full((cur_batch,), t_int, device=device, dtype=torch.long)
+            with torch.no_grad():
+                noise_pred = unet(x, t).sample
+            x = scheduler.step(noise_pred, t, x).prev_sample
+        samples = (x.clamp(-1, 1) + 1) / 2
+        for i in range(cur_bs):
+            img = TF.to_pil_image(samples[i].cpu())
+            img.save(samples_out / f"sample_{idx:06d}.png")
+            idx += 1
+        produced += cur_bs
 
-            noise_pred = unet(x, t_tensor).sample
-            step_out = scheduler.step(noise_pred, t_int, x)
-            x = step_out["prev_sample"]
+    print(f"Wrote {total_images} samples to: {samples_out}")
 
-        # map to [0,1]
-        samples = (x.clamp(-1, 1) + 1) / 2.0
 
-        # save to disk
-        for i, img_tensor in enumerate(samples):
-            img = TF.to_pil_image(img_tensor.cpu())
-            img.save(os.path.join(SAMPLES_OUT_DIR, f"sample_{img_idx:06d}.png"))
-            img_idx += 1
-
-        print(f" Saved batch {b+1}/{num_batches} (total saved: {img_idx})")
-
-print(f" All {img_idx} images saved to: {SAMPLES_OUT_DIR}")
+if __name__ == "__main__":
+    main()

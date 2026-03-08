@@ -1,214 +1,210 @@
-from __future__ import print_function
-import os
+from __future__ import annotations
+
 import argparse
+from typing import Optional
+
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import torchvision
-from torch.autograd import Variable
-import torch.optim as optim
+from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-from models.wideresnet import *
-from models.resnet import *
-from utils import get_model
-from torchvision.models import resnet18
+
+from utils import load_model_from_checkpoint
 
 
-parser = argparse.ArgumentParser(description='PyTorch CIFAR PGD Attack Evaluation')
-parser.add_argument('--test-batch-size', type=int, default=200, metavar='N',
-                    help='input batch size for testing (default: 200)')
-parser.add_argument('--no-cuda', action='store_true', default=False,
-                    help='disables CUDA training')
-parser.add_argument('--epsilon', default=0.031,
-                    help='perturbation')
-parser.add_argument('--num-steps', default=40,
-                    help='perturb number of steps')
-parser.add_argument('--step-size', default=0.01,
-                    help='perturb step size')
-parser.add_argument('--random',
-                    default=True,
-                    help='random initialization for PGD')
-parser.add_argument('--model-path',
-                    default='',
-                    help='model for white-box attack evaluation')
-parser.add_argument('--source-model-path',
-                    default='./checkpoints/model_cifar_wrn.pt',
-                    help='source model for black-box attack evaluation')
-parser.add_argument('--target-model-path',
-                    default='./checkpoints/model_cifar_wrn.pt',
-                    help='target model for black-box attack evaluation')
-parser.add_argument('--white-box-attack', default=True,
-                    help='whether perform white-box attack')
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="CIFAR-10 PGD Attack Evaluation")
 
-args = parser.parse_args()
+    parser.add_argument(
+        "--mode",
+        default="whitebox",
+        choices=("whitebox", "blackbox"),
+        help="Attack mode.",
+    )
+    parser.add_argument("--model", default="wrn-28-10", help="Model architecture.")
+    parser.add_argument(
+        "--model_path",
+        default=None,
+        help="Checkpoint path for white-box evaluation.",
+    )
+    parser.add_argument(
+        "--source_model_path",
+        default=None,
+        help="Checkpoint path for the source model (black-box).",
+    )
+    parser.add_argument(
+        "--target_model_path",
+        default=None,
+        help="Checkpoint path for the target model (black-box).",
+    )
 
-# settings
-use_cuda = not args.no_cuda and torch.cuda.is_available()
-device = torch.device("cuda" if use_cuda else "cpu")
-kwargs = {'num_workers': 1, 'pin_memory': True} if use_cuda else {}
+    parser.add_argument("--data_dir", default="./data", help="Dataset directory.")
+    parser.add_argument(
+        "--download",
+        dest="download",
+        action="store_true",
+        help="Download dataset if missing.",
+    )
+    parser.add_argument(
+        "--no-download",
+        dest="download",
+        action="store_false",
+        help="Do not download dataset (default).",
+    )
+    parser.set_defaults(download=False)
 
-# set up data loader
-transform_test = transforms.Compose([transforms.ToTensor(),])
-testset = torchvision.datasets.CIFAR10(root='../data', train=False, download=True, transform=transform_test)
-test_loader = torch.utils.data.DataLoader(testset, batch_size=args.test_batch_size, shuffle=False, **kwargs)
+    parser.add_argument("--batch_size", type=int, default=200, help="Batch size.")
+    parser.add_argument(
+        "--n_examples",
+        type=int,
+        default=None,
+        help="Optional cap on number of test examples to evaluate.",
+    )
+
+    parser.add_argument("--epsilon", type=float, default=0.031, help="Linf epsilon.")
+    parser.add_argument("--num_steps", type=int, default=40, help="PGD steps.")
+    parser.add_argument("--step_size", type=float, default=0.01, help="PGD step size.")
+    parser.add_argument(
+        "--random_start",
+        dest="random_start",
+        action="store_true",
+        help="Use random initialization (default).",
+    )
+    parser.add_argument(
+        "--no-random_start",
+        dest="random_start",
+        action="store_false",
+        help="Disable random initialization.",
+    )
+    parser.set_defaults(random_start=True)
+
+    parser.add_argument("--no-cuda", action="store_true", default=False, help="Disable CUDA.")
+    return parser
 
 
-def _pgd_whitebox(model,
-                  X,
-                  y,
-                  epsilon=args.epsilon,
-                  num_steps=args.num_steps,
-                  step_size=args.step_size):
-    out = model(X)
-    err = (out.data.max(1)[1] != y.data).float().sum()
-    X_pgd = Variable(X.data, requires_grad=True)
-    if args.random:
-        random_noise = torch.FloatTensor(*X_pgd.shape).uniform_(-epsilon, epsilon).to(device)
-        X_pgd = Variable(X_pgd.data + random_noise, requires_grad=True)
+def _die(message: str) -> None:
+    raise SystemExit(message)
+
+
+def _load_cifar10_test_loader(args: argparse.Namespace, use_cuda: bool) -> DataLoader:
+    transform_test = transforms.Compose([transforms.ToTensor()])
+    try:
+        testset = datasets.CIFAR10(
+            root=args.data_dir,
+            train=False,
+            download=args.download,
+            transform=transform_test,
+        )
+    except Exception as e:  # noqa: BLE001
+        _die(str(e))
+
+    loader_kwargs = {"num_workers": 0, "pin_memory": True} if use_cuda else {"num_workers": 0}
+    return DataLoader(testset, batch_size=args.batch_size, shuffle=False, **loader_kwargs)
+
+
+def _load_model(arch: str, ckpt_path: str, device: torch.device) -> torch.nn.Module:
+    model = load_model_from_checkpoint(
+        arch,
+        ckpt_path,
+        map_location="cpu",
+        num_classes=10,
+        device=device,
+    )
+    model.eval()
+    return model
+
+
+def pgd_linf(
+    model_for_grad: torch.nn.Module,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    *,
+    epsilon: float,
+    num_steps: int,
+    step_size: float,
+    random_start: bool,
+) -> torch.Tensor:
+    x_adv = x.detach()
+    if random_start:
+        x_adv = x_adv + torch.empty_like(x_adv).uniform_(-epsilon, epsilon)
+        x_adv = torch.clamp(x_adv, 0.0, 1.0)
 
     for _ in range(num_steps):
-        opt = optim.SGD([X_pgd], lr=1e-3)
-        opt.zero_grad()
-
+        x_adv.requires_grad_(True)
         with torch.enable_grad():
-            loss = nn.CrossEntropyLoss()(model(X_pgd), y)
-        loss.backward()
-        eta = step_size * X_pgd.grad.data.sign()
-        X_pgd = Variable(X_pgd.data + eta, requires_grad=True)
-        eta = torch.clamp(X_pgd.data - X.data, -epsilon, epsilon)
-        X_pgd = Variable(X.data + eta, requires_grad=True)
-        X_pgd = Variable(torch.clamp(X_pgd, 0, 1.0), requires_grad=True)
-    err_pgd = (model(X_pgd).data.max(1)[1] != y.data).float().sum()
-    print('err pgd (white-box): ', err_pgd)
-    return err, err_pgd
+            loss = F.cross_entropy(model_for_grad(x_adv), y)
+        grad = torch.autograd.grad(loss, x_adv)[0]
+        x_adv = x_adv.detach() + step_size * grad.sign()
+        x_adv = torch.min(torch.max(x_adv, x - epsilon), x + epsilon)
+        x_adv = torch.clamp(x_adv, 0.0, 1.0)
+
+    return x_adv.detach()
 
 
-def _pgd_blackbox(model_target,
-                  model_source,
-                  X,
-                  y,
-                  epsilon=args.epsilon,
-                  num_steps=args.num_steps,
-                  step_size=args.step_size):
-    out = model_target(X)
-    err = (out.data.max(1)[1] != y.data).float().sum()
-    X_pgd = Variable(X.data, requires_grad=True)
-    if args.random:
-        random_noise = torch.FloatTensor(*X_pgd.shape).uniform_(-epsilon, epsilon).to(device)
-        X_pgd = Variable(X_pgd.data + random_noise, requires_grad=True)
-
-    for _ in range(num_steps):
-        opt = optim.SGD([X_pgd], lr=1e-3)
-        opt.zero_grad()
-        with torch.enable_grad():
-            loss = nn.CrossEntropyLoss()(model_source(X_pgd), y)
-        loss.backward()
-        eta = step_size * X_pgd.grad.data.sign()
-        X_pgd = Variable(X_pgd.data + eta, requires_grad=True)
-        eta = torch.clamp(X_pgd.data - X.data, -epsilon, epsilon)
-        X_pgd = Variable(X.data + eta, requires_grad=True)
-        X_pgd = Variable(torch.clamp(X_pgd, 0, 1.0), requires_grad=True)
-
-    err_pgd = (model_target(X_pgd).data.max(1)[1] != y.data).float().sum()
-    print('err pgd black-box: ', err_pgd)
-    return err, err_pgd
+@torch.no_grad()
+def _eval_batch(model: torch.nn.Module, x: torch.Tensor, y: torch.Tensor) -> int:
+    pred = model(x).argmax(dim=1)
+    return pred.eq(y).sum().item()
 
 
-def eval_adv_test_whitebox(model, device, test_loader):
-    """
-    evaluate model by white-box attack
-    """
-    model.eval()
-    robust_err_total = 0
-    natural_err_total = 0
+def main(argv: Optional[list[str]] = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
 
-    for data, target in test_loader:
-        data, target = data.to(device), target.to(device)
-        # pgd attack
-        X, y = Variable(data, requires_grad=True), Variable(target)
-        err_natural, err_robust = _pgd_whitebox(model, X, y)
-        robust_err_total += err_robust
-        natural_err_total += err_natural
-    print('natural_err_total: ', natural_err_total)
-    print('robust_err_total: ', robust_err_total)
+    use_cuda = (not args.no_cuda) and torch.cuda.is_available()
+    device = torch.device("cuda" if use_cuda else "cpu")
 
-def eval_adv_test_whitebox2(model, device, test_loader):
-    model.eval()
-    robust_err_total = 0
-    natural_err_total = 0
-    total_samples = len(test_loader.dataset)
+    test_loader = _load_cifar10_test_loader(args, use_cuda=use_cuda)
 
-    for data, target in test_loader:
-        data, target = data.to(device), target.to(device)
-        # PGD white-box attack
-        X, y = Variable(data, requires_grad=True), Variable(target)
-        err_natural, err_robust = _pgd_whitebox(model, X, y)
-        natural_err_total += err_natural
-        robust_err_total += err_robust
-
-    natural_accuracy = 100. * (total_samples - natural_err_total) / total_samples
-    robust_accuracy = 100. * (total_samples - robust_err_total) / total_samples
-
-    print('White-box attack:')
-    print('Natural Accuracy: {:.2f}%'.format(natural_accuracy))
-    print('Robust Accuracy: {:.2f}%'.format(robust_accuracy))
-
-
-def eval_adv_test_blackbox(model_target, model_source, device, test_loader):
-    """
-    evaluate model by black-box attack
-    """
-    model_target.eval()
-    model_source.eval()
-    robust_err_total = 0
-    natural_err_total = 0
-
-    for data, target in test_loader:
-        data, target = data.to(device), target.to(device)
-        # pgd attack
-        X, y = Variable(data, requires_grad=True), Variable(target)
-        err_natural, err_robust = _pgd_blackbox(model_target, model_source, X, y)
-        robust_err_total += err_robust
-        natural_err_total += err_natural
-        natural_accuracy = 100. * natural_err_total / len(test_loader)
-        robust_accuracy = 100. * (total_samples - robust_err_total) / len(test_loader)
-
-    print('natural_err_total: ', natural_accuracy)
-    print('robust_err_total: ', robust_accuracy)
-
-
-def main():
-
-    if args.white_box_attack:
-        # white-box attack
-        print('pgd white-box attack')
-        #model = WideResNet().to(device)
-        model = 'wrn-28-10'
-        from torchvision.models import resnet18
-        #model = resnet18(num_classes=10).to(device)
-        #model = ResNet18().to(device)
-        num_classes = 10
-        model = get_model(model, num_classes=10,
-                       normalize_input=False)
-        #model = PreActResNet18().cuda()
-        model.eval()
-        if use_cuda:
-            model = torch.nn.DataParallel(model).cuda()
-        checkpoint = torch.load('')
-        model.load_state_dict(checkpoint)
-        #model.load_state_dict(torch.load(args.model_path))
-
-        eval_adv_test_whitebox2(model, device, test_loader)
+    if args.mode == "whitebox":
+        if not args.model_path:
+            _die("--model_path is required for whitebox mode.")
+        model = _load_model(args.model, args.model_path, device)
+        grad_model = model
+        eval_model = model
     else:
-        # black-box attack
-        print('pgd black-box attack')
-        model_target = WideResNet().to(device)
-        model_target.load_state_dict(torch.load(args.target_model_path))
-        model_source = WideResNet().to(device)
-        model_source.load_state_dict(torch.load(args.source_model_path))
+        if not args.source_model_path or not args.target_model_path:
+            _die("--source_model_path and --target_model_path are required for blackbox mode.")
+        grad_model = _load_model(args.model, args.source_model_path, device)
+        eval_model = _load_model(args.model, args.target_model_path, device)
 
-        eval_adv_test_blackbox(model_target, model_source, device, test_loader)
+    total = 0
+    natural_correct = 0
+    robust_correct = 0
+
+    for data, target in test_loader:
+        if args.n_examples is not None and total >= args.n_examples:
+            break
+        data, target = data.to(device), target.to(device)
+
+        if args.n_examples is not None:
+            remaining = args.n_examples - total
+            if remaining <= 0:
+                break
+            if data.size(0) > remaining:
+                data = data[:remaining]
+                target = target[:remaining]
+
+        natural_correct += _eval_batch(eval_model, data, target)
+        x_adv = pgd_linf(
+            grad_model,
+            data,
+            target,
+            epsilon=float(args.epsilon),
+            num_steps=int(args.num_steps),
+            step_size=float(args.step_size),
+            random_start=bool(args.random_start),
+        )
+        robust_correct += _eval_batch(eval_model, x_adv, target)
+
+        total += int(target.size(0))
+
+    natural_acc = 100.0 * natural_correct / max(1, total)
+    robust_acc = 100.0 * robust_correct / max(1, total)
+
+    print(f"Mode: {args.mode}")
+    print(f"Natural Accuracy: {natural_acc:.2f}% ({natural_correct}/{total})")
+    print(f"Robust Accuracy:  {robust_acc:.2f}% ({robust_correct}/{total})")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
